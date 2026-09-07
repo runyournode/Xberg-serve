@@ -1,0 +1,6 @@
+.git
+.idea
+.github
+mnt
+docker/mount_runtime
+README.md

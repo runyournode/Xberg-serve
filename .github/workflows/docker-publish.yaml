@@ -1,0 +1,116 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    tags:
+      - "v*.*.*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-features:
+    # Fail fast and cheap: verify the Cargo feature names this project
+    # depends on still exist in the published crates before spending
+    # CI minutes on a `cargo install` that would only fail at the last step.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check pinned xberg features
+        run: bash scripts/check-features.sh
+
+  build:
+    needs: check-features
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # required for SLSA provenance attestation signing via Sigstore/OIDC
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Read pinned xberg version
+        id: versions
+        run: |
+          set -a
+          . ./VERSIONS
+          set +a
+          echo "XBERG_VERSION=${XBERG_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (ultralight)
+        id: meta-ultralight
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=-ultralight
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'dev') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha
+
+      - name: Extract metadata (ocrlight)
+        id: meta-ocrlight
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            suffix=-ocrlight
+          tags: |
+            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=dev,enable=${{ github.ref == format('refs/heads/{0}', 'dev') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha
+
+      - name: Build and push ultralight image (no OCR/ML, HEIC included)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/build/${{ env.XBERG_VERSION }}/Dockerfile.ultralight
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta-ultralight.outputs.tags }}
+          labels: ${{ steps.meta-ultralight.outputs.labels }}
+          cache-from: type=gha,scope=ultralight
+          cache-to: type=gha,mode=max,scope=ultralight
+          provenance: mode=max
+
+      - name: Build and push ocrlight image (dynamic Tesseract, fra/eng/osd)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/build/${{ env.XBERG_VERSION }}/Dockerfile.ocrlight
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta-ocrlight.outputs.tags }}
+          labels: ${{ steps.meta-ocrlight.outputs.labels }}
+          cache-from: type=gha,scope=ocrlight
+          cache-to: type=gha,mode=max,scope=ocrlight
+          provenance: mode=max

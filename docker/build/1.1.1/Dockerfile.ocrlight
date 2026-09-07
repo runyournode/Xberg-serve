@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1.7
+#
+# Profile "ocrlight": ultralight + Tesseract OCR, DYNAMICALLY linked against
+# the system libtesseract/libleptonica, plus HEIC (same codec dependency as
+# ultralight -- no extra ML). Still no ONNX Runtime, no candle VLM, no GPU.
+#
+# Feature set: api + pdf-ocr + xberg/tesseract-dynamic + heic.
+#   pdf-ocr           -> pdf-heuristic + ocr-surface + xberg/ocr
+#   xberg/tesseract-dynamic -> xberg-tesseract's `system-linking`, which takes
+#                        precedence over the crate's own `static-linking`
+#                        default (see crates/xberg/Cargo.toml upstream).
+#   heic               -> formats (formats-no-heic + HEIC/AVIF via libheif)
+#
+# This deliberately does NOT enable paddle-ocr, sceptre-ocr, candle-vlm-ocr or
+# layout-detection -- those pull `ort` (ONNX Runtime) and hf-hub, which
+# download model weights on first use and are therefore unusable air-gapped
+# without a pre-seeded HF cache. Tesseract is the only OCR backend here and it
+# is fully offline once the image is built: apt-get install runs during
+# `docker build` on a connected CI runner, so the .traineddata language packs
+# are baked into the image layer -- nothing is fetched at `docker run`.
+
+ARG RUST_IMAGE=rust:1.95-trixie
+ARG RUNTIME_IMAGE=debian:trixie-slim
+
+FROM ${RUST_IMAGE} AS builder
+ARG XBERG_VERSION=1.1.1
+
+# Dynamic linking against the system's Tesseract/Leptonica -- no cmake, no
+# vendored source compile. Much lighter and faster than static-linking's
+# from-source build. libheif-dev is the HEIC/AVIF codec (pkg-config
+# discovered), same as ultralight.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        pkg-config \
+        libtesseract-dev \
+        libleptonica-dev \
+        libheif-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN cargo install xberg-cli \
+      --version "${XBERG_VERSION}" \
+      --locked \
+      --no-default-features \
+      --features "api,pdf-ocr,xberg/tesseract-dynamic,heic" \
+      --root /out \
+ && strip /out/bin/xberg
+
+# Expect to see libtesseract, libleptonica and libheif here, nothing else
+# unusual -- same guard-rail role as in ultralight.
+RUN ldd /out/bin/xberg | tee /out/ldd.txt && cat /out/ldd.txt
+
+FROM ${RUNTIME_IMAGE} AS runtime
+ARG XBERG_VERSION=1.1.1
+
+LABEL org.opencontainers.image.title="xberg-serve-ocrlight" \
+      org.opencontainers.image.description="xberg REST extraction server with dynamic Tesseract OCR (fra/eng/osd baked in) + HEIC" \
+      org.opencontainers.image.version="${XBERG_VERSION}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/xberg-io/xberg"
+
+WORKDIR /app
+
+# tesseract-ocr-<lang> packages carry the .traineddata; the base tesseract-ocr
+# package carries none. libtesseract5/libleptonica pulled in transitively as
+# runtime deps of tesseract-ocr. libheif1 is the HEIC/AVIF runtime lib.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tini \
+        tesseract-ocr \
+        tesseract-ocr-fra \
+        tesseract-ocr-eng \
+        tesseract-ocr-osd \
+        libheif1; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid 10001 xberg; \
+    useradd --system --uid 10001 --gid xberg --no-create-home --shell /usr/sbin/nologin xberg
+
+# Guard rail: fail the build (on the connected CI runner), not the deploy
+# (in air-gap), if a language pack didn't land where expected. Path verified
+# against the real Debian trixie package (packages.debian.org, tesseract-ocr-fra
+# filelist): /usr/share/tesseract-ocr/5/tessdata/<lang>.traineddata.
+RUN set -eux; \
+    for lang in fra eng osd; do \
+        test -s "/usr/share/tesseract-ocr/5/tessdata/${lang}.traineddata"; \
+    done
+
+COPY --from=builder /out/bin/xberg /usr/local/bin/xberg
+COPY --from=builder /out/ldd.txt   /usr/local/share/xberg/ldd.txt
+
+ENV XBERG_CACHE_DIR=/app/.xberg \
+    RUST_LOG=info \
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+RUN install -d -o 10001 -g 10001 /app/.xberg
+
+# Fail the build rather than ship an image whose dynamic deps are unsatisfied.
+RUN ldd /usr/local/bin/xberg | grep -q 'not found' && exit 1 || true
+
+USER 10001:10001
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/xberg", "--version"]
+
+ENTRYPOINT ["/usr/bin/tini", "--", "xberg"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,93 @@
+# xberg-serve -- two profiles built by .github/workflows/docker-publish.yaml
+# and published to ghcr.io/runyournode/xberg-serve.
+#
+#   docker compose -f docker/compose.yaml --env-file .env up -d
+#
+# Air-gap: both images are self-contained once built (no runtime downloads --
+# see docker/build/<version>/Dockerfile.* for what each profile bakes in).
+# Pull them on a connected machine / let CI push them, then `docker save` /
+# `scp` / `docker load` onto the air-gapped host if it has no registry access.
+
+services:
+  xberg-ultralight:
+    image: ghcr.io/runyournode/xberg-serve:${XBERG_TAG:-main}-ultralight
+    container_name: xberg-ultralight
+    restart: unless-stopped
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      RUST_LOG: ${XBERG_LOG:-info}
+      XBERG_MAX_CONCURRENT_EXTRACTIONS: ${XBERG_MAX_CONCURRENT:-2}
+      # Air-gap hygiene: nothing in this profile should ever egress. Empty
+      # proxies make an accidental outbound call fail fast and loudly instead
+      # of hanging.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: "*"
+    ports:
+      - "127.0.0.1:${XBERG_PORT:-8083}:8000"
+    volumes:
+      - ./mount_runtime/cache_ultralight:/app/.xberg:Z
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${XBERG_CPUS:-2}"
+          memory: ${XBERG_MEM:-1g}
+    healthcheck:
+      # Adjust once verified against `xberg serve --help` / the OpenAPI doc.
+      test: ["CMD", "/usr/local/bin/xberg", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  xberg-ocrlight:
+    image: ghcr.io/runyournode/xberg-serve:${XBERG_TAG:-main}-ocrlight
+    container_name: xberg-ocrlight
+    restart: unless-stopped
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      RUST_LOG: ${XBERG_LOG:-info}
+      XBERG_MAX_CONCURRENT_EXTRACTIONS: ${XBERG_MAX_CONCURRENT:-2}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: "*"
+    ports:
+      - "127.0.0.1:${XBERG_OCR_PORT:-8084}:8000"
+    volumes:
+      - ./mount_runtime/cache_ocrlight:/app/.xberg:Z
+    read_only: true
+    tmpfs:
+      # OCR renders pages to bitmaps; give it real scratch space.
+      - /tmp:size=2g,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "${XBERG_OCR_CPUS:-4}"
+          memory: ${XBERG_OCR_MEM:-3g}
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/xberg", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

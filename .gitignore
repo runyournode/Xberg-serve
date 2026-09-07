@@ -1,0 +1,16 @@
+# secrets / local overrides
+.env
+
+# IDE
+.idea/
+
+# rust
+target/
+
+# runtime bind-mount content: keep the tree structure (.gitkeep), ignore
+# everything a running container writes into it
+docker/mount_runtime/**
+!docker/mount_runtime/**/
+!docker/mount_runtime/**/.gitkeep
+
+mnt/

@@ -1,0 +1,87 @@
+# syntax=docker/dockerfile:1.7
+#
+# Profile "ultralight": document extraction, no OCR, no ML/ONNX.
+#
+# --no-default-features + api,heic pulls in, transitively:
+#   legacy-base -> formats-no-heic + analysis + core-cli + ocr-surface(empty gate)
+#   xberg/api   -> axum server
+#   heic        -> formats (formats-no-heic + HEIC/AVIF via libheif)
+# and therefore EXCLUDES everything expensive that xberg-cli's default
+# profile would drag in: ocr, paddle-ocr, sceptre-ocr, candle-vlm-ocr,
+# layout-detection, embeddings, chunking-tokenizers, liter-llm, tree-sitter.
+#
+# Consequence: no ONNX Runtime, no candle, no hf-hub model downloads at
+# runtime, no libtesseract/libleptonica link. The only native dependency is
+# libheif (a codec, packaged in Debian trixie -- no source compile needed).
+# Build has no build.rs that reaches the network beyond crates.io/cargo
+# registry, so this profile is reproducible from a `cargo vendor` bundle if
+# ever needed.
+
+ARG RUST_IMAGE=rust:1.95-trixie
+ARG RUNTIME_IMAGE=debian:trixie-slim
+
+FROM ${RUST_IMAGE} AS builder
+ARG XBERG_VERSION=1.1.1
+
+# libheif-dev: HEIC/AVIF codec headers, discovered via pkg-config by
+# xberg-libheif's build.rs. Everything else (gcc/g++) already ships in the
+# rust image. If this stage ever starts needing cmake or clang, an OCR/ML
+# feature crept back in -- treat that as a regression.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends pkg-config libheif-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN cargo install xberg-cli \
+      --version "${XBERG_VERSION}" \
+      --locked \
+      --no-default-features \
+      --features "api,heic" \
+      --root /out \
+ && strip /out/bin/xberg
+
+# Record what actually got linked. This is the guard rail: if OCR or ORT
+# features sneak back in, extra shared objects show up here and the runtime
+# stage breaks loudly instead of silently shipping a fatter image. Expect to
+# see libheif here and nothing else unusual.
+RUN ldd /out/bin/xberg | tee /out/ldd.txt
+
+FROM ${RUNTIME_IMAGE} AS runtime
+ARG XBERG_VERSION=1.1.1
+
+LABEL org.opencontainers.image.title="xberg-serve-ultralight" \
+      org.opencontainers.image.description="xberg REST extraction server, no OCR/ML, HEIC included" \
+      org.opencontainers.image.version="${XBERG_VERSION}" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.source="https://github.com/xberg-io/xberg"
+
+WORKDIR /app
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates libheif1 tini; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid 10001 xberg; \
+    useradd --system --uid 10001 --gid xberg --no-create-home --shell /usr/sbin/nologin xberg
+
+COPY --from=builder /out/bin/xberg /usr/local/bin/xberg
+COPY --from=builder /out/ldd.txt   /usr/local/share/xberg/ldd.txt
+
+# Content-hash cache. Bind-mounted from docker/mount_runtime/ in
+# docker/compose.yaml. UID is fixed (not a dynamic system UID) precisely so
+# the host-side bind-mount directory can be chowned reproducibly.
+ENV XBERG_CACHE_DIR=/app/.xberg \
+    RUST_LOG=info
+RUN install -d -o 10001 -g 10001 /app/.xberg
+
+USER 10001:10001
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/xberg", "--version"]
+
+# Verify the exact flag names once against the built image:
+#   docker run --rm xberg-serve:ultralight serve --help
+ENTRYPOINT ["/usr/bin/tini", "--", "xberg"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

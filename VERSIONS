@@ -1,0 +1,12 @@
+# Single source of truth for which upstream xberg release is current.
+# CI (.github/workflows/docker-publish.yaml) and scripts/check-features.sh
+# both source this to know which docker/build/<version>/ folder to use.
+#
+# Base images, Tesseract language packs, TESSDATA_PREFIX etc. are NOT here:
+# they live inside that version's own Dockerfiles
+# (docker/build/<version>/Dockerfile.*), self-contained per release.
+#
+# Bumping the version: add docker/build/<new-version>/ with its two
+# Dockerfiles, then update XBERG_VERSION below.
+
+XBERG_VERSION=1.1.1
