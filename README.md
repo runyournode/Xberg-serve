@@ -6,7 +6,7 @@ Custom Docker images for [xberg](https://github.com/xberg-io/xberg) 1.1.1
 
 | Profile | File | OCR | ML/ONNX/GPU | HEIC | Runtime base | Use case |
 |---|---|---|---|---|---|---|
-| `ultralight` | `docker/build/1.1.1/Dockerfile.ultralight` | no | no | yes | distroless (no shell, no package manager) | default — text-layer documents, HEIC images |
+| `ultralight` | `docker/build/1.1.1/Dockerfile.ultralight` | no | no | no | distroless (no shell, no package manager) | default — text-layer documents |
 | `ocrlight` | `docker/build/1.1.1/Dockerfile.ocrlight` | Tesseract (dynamic) | no | yes | `debian:trixie-slim` | scanned documents, HEIC images |
 
 Both run on CPU, with no download at runtime: everything needed (the `xberg`
@@ -24,28 +24,34 @@ its conventions (`trixie` base, `tini` as PID 1, non-root user,
 `cargo install xberg-cli --no-default-features --features ...` to control
 exactly what gets compiled, instead of cloning the whole monorepo.
 
-- **`ultralight`**: `--features "api,heic"` → `legacy-base` (office
+- **`ultralight`**: `--features api` → `legacy-base` (office
   formats/PDF/email/HTML/XML/archives/sqlite/mdx/svg/wordperfect, language
-  detection, chunking) + axum server + HEIC/AVIF. HEIC adds no deep
-  learning at all: `libheif` is a codec (like libjpeg), packaged in Debian
-  trixie (`libheif-dev`/`libheif1`), no source compile needed. Its runtime
-  stage is [distroless](https://github.com/GoogleContainerTools/distroless)
+  detection, chunking) + axum server. Its runtime stage is
+  [distroless](https://github.com/GoogleContainerTools/distroless)
   (`gcr.io/distroless/cc-debian13:nonroot`, same Debian release as the
   builder so no glibc mismatch): no shell, no `apt`, no CLI binaries beyond
-  `xberg` itself and a statically-linked `tini`. Everything the runtime
-  needs (`libheif` + its dlopen'd codec plugin, since `libheif` loads those
-  at runtime rather than linking them) is extracted from the builder stage
-  by path and `COPY`'d in — there's no shell in the final stage to install
-  anything itself.
+  `xberg` itself and a statically-linked `tini`. Every `.so` the binary
+  actually links is extracted from the builder stage by path and `COPY`'d
+  in — there's no shell in the final stage to install anything itself.
+  `heic` was tried here and dropped: confirmed locally that `xberg` routes
+  every raster image through its OCR pipeline (`xberg formats` never lists
+  `.heic`/`.jpg`/`.png`, only vector `.svg`), so decoding HEIC without an
+  OCR backend compiled in has nothing to feed it — `extract` on a real
+  `.heic` file returned `Unsupported format: image/heif` even with the
+  codec linked and its plugin loading correctly. HEIC only earns its keep
+  in `ocrlight`, below.
 - **`ocrlight`**: `--features "api,pdf-ocr,xberg/tesseract-dynamic,heic"` →
   ultralight + Tesseract dynamically linked against the system's
   `libtesseract`/`libleptonica`, instead of compiling those from vendored
   sources (xberg's default `static-linking` behavior). Much faster to
   build, and — crucially — **rebuildable offline**, which wasn't possible
-  before upstream added the `tesseract-dynamic` feature. HEIC rides along
-  for free, same codec dependency as `ultralight`, no extra ML. Language
-  packs (`tesseract-ocr-fra/eng/osd`) come from apt, not from an HTTP
-  download we script ourselves.
+  before upstream added the `tesseract-dynamic` feature. HEIC here actually
+  works (an OCR backend exists to consume the decoded image) — confirmed
+  locally with `xberg doctor`, which reports Tesseract 5.5.0 and the
+  `tessdata` path. `libheif` is a codec (like libjpeg), packaged in Debian
+  trixie (`libheif-dev`/`libheif1`), no source compile needed, no deep
+  learning. Language packs (`tesseract-ocr-fra/eng/osd`) come from apt, not
+  from an HTTP download we script ourselves.
 
 The ONNX-backed OCR engines (`paddle-ocr`, `sceptre-ocr`) and the `candle-*`
 VLMs stay out of scope: they resolve their models from Hugging Face on first
@@ -68,6 +74,7 @@ docker/
 VERSIONS                          # pins XBERG_VERSION -> which docker/build/<version>/ is current
 scripts/
   check-features.sh               # verifies feature names exist; runs in CI before every build
+  build-local.sh                  # build one/both profiles locally, same Dockerfiles as CI
   smoke.sh                        # post-deploy sanity check (manual)
 ```
 
@@ -75,8 +82,8 @@ scripts/
 
 ```bash
 bash scripts/check-features.sh
-docker build -f docker/build/1.1.1/Dockerfile.ultralight -t xberg-serve:ultralight .
-docker build -f docker/build/1.1.1/Dockerfile.ocrlight   -t xberg-serve:ocrlight   .
+bash scripts/build-local.sh              # both profiles
+bash scripts/build-local.sh ultralight   # or just one
 ```
 
 ## CI
@@ -134,49 +141,57 @@ bases differ:
   installs `libtesseract5`/`libleptonica6` directly instead of the full
   `tesseract-ocr` CLI package: `xberg` links the library, never shells out
   to the `tesseract` binary, so the CLI package would only add ~15 unused
-  binaries and an unrelated dependency tail (cairo/pango/fontconfig/ICU,
-  and an embedded **libcurl** — a network client with no business being in
-  a no-egress image). `/etc/apt/sources.list*` is cleared after install, so
-  even if `apt`/`dpkg` themselves are still present, there's nothing
-  configured left to fetch from. Runs as a fixed non-root UID **10001**
-  (`useradd --system`, not a dynamic one, so the bind-mount stays
-  chownable): `chown -R 10001:10001 docker/mount_runtime/cache_ocrlight`.
+  binaries and an unrelated font-rendering tail
+  (cairo/pango/fontconfig/ICU). **Correction after actually inspecting the
+  built image's `ldd.txt`**: `libcurl` (and its own large dependency tree —
+  libssl, libgnutls, libldap, libkrb5, libssh2...) is *not* removed by that
+  change — it turns out to be a hard `Depends` of `libtesseract5` itself,
+  not just of the CLI package. It ships in the image either way, unused by
+  `xberg`'s own code paths, mitigated the same way as everything else here
+  (`NO_PROXY=*`, `read_only`, `cap_drop: ALL`) rather than actually absent.
+  `/etc/apt/sources.list*` is cleared after install, so even if `apt`/`dpkg`
+  themselves are still present, there's nothing configured left to fetch
+  from. Runs as a fixed non-root UID **10001** (`useradd --system`, not a
+  dynamic one, so the bind-mount stays chownable):
+  `chown -R 10001:10001 docker/mount_runtime/cache_ocrlight`.
 
 ## To verify once built
 
-Things not confirmed without actually running the binary — this repo has
-no local Docker build loop, so the first real CI build/run is the actual
-test:
+`scripts/build-local.sh` builds either or both profiles locally (same
+Dockerfiles CI uses) — use it before pushing when changing a Dockerfile,
+rather than guessing and waiting on a CI round-trip.
 
-1. **`xberg serve` flags.** `docker run --rm xberg-serve:ultralight serve
-   --help`. `--host`/`--port` are assumed; adjust `CMD` and `command:` if
-   they differ.
-2. **The real health endpoint.** `scripts/smoke.sh` reads `/openapi.json`.
+Confirmed locally already:
+
+- **`xberg serve` flags**: `--host`/`-H`, `--port`/`-p`, `--log-level`,
+  `--config` — `docker run --rm xberg-serve:ultralight serve --help`. The
+  Dockerfiles'/compose's assumed `--host`/`--port` are correct as-is.
+- **`ultralight`'s distroless conversion actually starts**: `serve --help`
+  and `--version` both run cleanly with no shared-library errors — the
+  copied `.so` closure and static `tini` resolve correctly.
+- **`ocrlight`'s Tesseract detection**: `docker run --rm xberg-serve:ocrlight
+  doctor` reports `tesseract 5.5.0; tessdata for ... language(s) at
+  /usr/share/tesseract-ocr/5/tessdata` — the dynamic-linking build and the
+  language packs both resolve as intended.
+
+Still open:
+
+1. **The real health endpoint.** `scripts/smoke.sh` reads `/openapi.json`.
    The current `healthcheck` uses `xberg --version` in the meantime —
    swap it for the real endpoint once known.
-3. **`ocrlight`'s dynamic linkage.** `docker run --rm xberg-serve:ocrlight
-   cat /usr/local/share/xberg/ldd.txt` — confirms everything resolves; the
-   build already fails on its own if a `.traineddata` file or a library is
-   missing (see the guard `RUN` steps in the Dockerfile), but it's worth
-   checking `TESSDATA_PREFIX` in practice against a real scanned document.
-4. **`ultralight`'s distroless conversion.** The riskiest untested part of
-   this repo right now: `docker run --rm xberg-serve:ultralight serve
-   --help` needs to actually start (confirms the copied `.so` closure and
-   `tini` resolve correctly with no shell to fall back on for debugging),
-   and a real HEIC file needs to decode successfully (confirms the
-   manually-copied `libheif` codec plugin — `dlopen()`'d, not linked, so
-   invisible to `ldd` — actually landed and loads). If either fails, the
-   fix is almost certainly in the `assemble`/lib-collection stage of
-   `Dockerfile.ultralight`, not in the application itself.
+2. **A real end-to-end extraction call** (`POST /extract` via `serve`,
+   rather than the CLI's `extract`/`doctor`) against both profiles, ideally
+   with `tests/corpus/` populated so `scripts/smoke.sh` has something to
+   check beyond `/openapi.json`.
 
 ## markgate integration
 
 xberg exposes its own REST contract, not the `PUT /process` returning
 `{page_content, metadata}` expected by Open WebUI's External Document
 Loader. The adapter lives on the markgate side, same as for foil-serve.
-Suggested routing: text-layer PDFs + office formats + HEIC → `ultralight`;
-scanned PDFs / images → `ocrlight`; tables / complex layouts →
-`foil-serve`. Switchover threshold: xberg treats a document as "scanned"
+Suggested routing: text-layer PDFs + office formats → `ultralight`;
+scanned PDFs / images (including HEIC) → `ocrlight`; tables / complex
+layouts → `foil-serve`. Switchover threshold: xberg treats a document as "scanned"
 below roughly 64 total non-whitespace characters and 32 per page on
 average — implementing that check in markgate avoids an unnecessary
 round-trip.

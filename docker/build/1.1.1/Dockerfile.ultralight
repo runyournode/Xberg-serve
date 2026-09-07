@@ -1,14 +1,15 @@
 # syntax=docker/dockerfile:1.7
 #
-# Profile "ultralight": document extraction, no OCR, no ML/ONNX. HEIC/AVIF
-# included (libheif is a codec, not a model -- see README). Runtime stage is
-# distroless: no shell, no package manager, no apt sources, nothing beyond
-# glibc/libstdc++/libheif + the static tini binary + the xberg binary itself.
+# Profile "ultralight": document extraction, no OCR, no ML/ONNX, no HEIC.
+# Runtime stage is distroless: no shell, no package manager, no apt sources,
+# nothing beyond glibc/libstdc++ + the static tini binary + xberg itself.
 #
-# --no-default-features + api,heic pulls in, transitively:
+# No `heic` here: it's only useful alongside an OCR backend. Stays in
+# `ocrlight`.
+#
+# --no-default-features + api pulls in, transitively:
 #   legacy-base -> formats-no-heic + analysis + core-cli + ocr-surface(empty gate)
 #   xberg/api   -> axum server
-#   heic        -> formats (formats-no-heic + HEIC/AVIF via libheif)
 # and therefore EXCLUDES everything expensive that xberg-cli's default
 # profile would drag in: ocr, paddle-ocr, sceptre-ocr, candle-vlm-ocr,
 # layout-detection, embeddings, chunking-tokenizers, liter-llm, tree-sitter.
@@ -20,59 +21,47 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
 FROM ${RUST_IMAGE} AS builder
 ARG XBERG_VERSION=1.1.1
 
-# libheif-dev: HEIC/AVIF codec headers, discovered via pkg-config by
-# xberg-libheif's build.rs. Everything else (gcc/g++) already ships in the
-# rust image. If this stage ever starts needing cmake or clang, an OCR/ML
-# feature crept back in -- treat that as a regression.
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends pkg-config libheif-dev; \
-    rm -rf /var/lib/apt/lists/*
+# No extra apt packages: gcc/g++ (needed by the vendored libwpd C++ build)
+# already ships in the rust image. If this stage ever starts needing cmake,
+# clang or pkg-config, an OCR/ML/codec feature crept back in -- treat that
+# as a regression.
 
 WORKDIR /build
 RUN cargo install xberg-cli \
       --version "${XBERG_VERSION}" \
       --locked \
       --no-default-features \
-      --features "api,heic" \
+      --features "api" \
       --root /out \
  && strip /out/bin/xberg
 
-# Record what actually got linked. This is the guard rail: if OCR or ORT
-# features sneak back in, extra shared objects show up here and the build
-# breaks loudly instead of silently shipping a fatter image. Expect to see
-# libheif here and nothing else unusual.
+# Record what actually got linked. This is the guard rail: if OCR, ORT or a
+# codec feature sneaks back in, extra shared objects show up here and the
+# build breaks loudly instead of silently shipping a fatter image.
 RUN ldd /out/bin/xberg | tee /out/ldd.txt
 
-# Collect the runtime .so closure for the distroless final stage below, which
-# has no apt/shell to install anything itself. Skip the handful already
-# guaranteed present in gcr.io/distroless/cc-debian13 (libc, libm, libpthread,
-# libdl, librt, libgcc_s, libstdc++, the dynamic linker) -- copying our own
-# copies over those is unnecessary duplication.
+# Collect the runtime .so closure for the distroless final stage below (no
+# apt/shell there to install anything). Skip libs guaranteed present in
+# gcr.io/distroless/cc-debian13 (libc, libm, libpthread, libdl, librt,
+# libgcc_s, libstdc++, the dynamic linker).
+#
+# Canonicalize each library's directory with `readlink -f` before copying:
+# on Debian trixie (usrmerge) /lib is a symlink to /usr/lib, and mirroring
+# ldd's literal "/lib/..." path collides with that symlink at COPY time
+# ("cannot copy to non-directory"). Keep the filename as-is though --
+# resolving the whole path could rename away from the soname the loader
+# looks up via DT_NEEDED.
 RUN set -eux; \
     mkdir -p /out/lib; \
     ldd /out/bin/xberg | awk '{print $3}' | grep '^/' | sort -u \
       | grep -Ev '/(libc|libm|libpthread|libdl|librt|libgcc_s|libstdc\+\+|ld-linux-x86-64)\.so' \
       | while read -r so; do \
-          mkdir -p "/out/lib$(dirname "$so")"; \
-          cp -L "$so" "/out/lib$so"; \
+          real_dir="$(readlink -f "$(dirname "$so")")"; \
+          base="$(basename "$so")"; \
+          mkdir -p "/out/lib${real_dir}"; \
+          cp -L "$so" "/out/lib${real_dir}/${base}"; \
         done; \
     find /out/lib -type f
-
-# libheif dlopen()s its codec plugins at runtime instead of linking them --
-# `ldd` above never sees them, so a naive "copy whatever ldd says" conversion
-# would build clean and then silently fail to decode HEIC at runtime. Copy
-# whichever plugin package(s) apt actually resolved (libheif1's Depends is
-# libheif-plugin-libde265 plus one of dav1d/aomdec) explicitly instead.
-RUN set -eux; \
-    for pkg in libheif-plugin-libde265 libheif-plugin-dav1d libheif-plugin-aomdec; do \
-        dpkg -s "$pkg" >/dev/null 2>&1 || continue; \
-        for f in $(dpkg -L "$pkg" | grep '\.so'); do \
-            mkdir -p "/out/lib$(dirname "$f")"; \
-            cp -L "$f" "/out/lib$f"; \
-        done; \
-    done; \
-    find /out/lib -name '*.so*'
 
 # --- assemble: gathers everything the shell-less final stage needs, so the
 # final stage can be pure COPY instructions. Has apt/shell; nothing here ships.
@@ -100,7 +89,7 @@ FROM ${RUNTIME_IMAGE} AS runtime
 ARG XBERG_VERSION=1.1.1
 
 LABEL org.opencontainers.image.title="xberg-serve-ultralight" \
-      org.opencontainers.image.description="xberg REST extraction server, no OCR/ML, HEIC included, distroless" \
+      org.opencontainers.image.description="xberg REST extraction server, no OCR/ML, distroless" \
       org.opencontainers.image.version="${XBERG_VERSION}" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.source="https://github.com/xberg-io/xberg"
