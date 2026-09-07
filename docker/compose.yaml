@@ -30,6 +30,10 @@ services:
       NO_PROXY: "*"
     ports:
       - "127.0.0.1:${XBERG_PORT:-8083}:8000"
+    # ultralight's runtime image is distroless (no shell/useradd), so its
+    # fixed non-root user is the distroless base's own uid/gid 65532, not
+    # the 10001 used by ocrlight. Before first run:
+    #   chown -R 65532:65532 docker/mount_runtime/cache_ultralight
     volumes:
       - ./mount_runtime/cache_ultralight:/app/.xberg:Z
     read_only: true

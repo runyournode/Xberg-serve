@@ -19,7 +19,7 @@
 # `docker build` on a connected CI runner, so the .traineddata language packs
 # are baked into the image layer -- nothing is fetched at `docker run`.
 
-ARG RUST_IMAGE=rust:1.95-trixie
+ARG RUST_IMAGE=rust:1.98-trixie
 ARG RUNTIME_IMAGE=debian:trixie-slim
 
 FROM ${RUST_IMAGE} AS builder
@@ -62,20 +62,29 @@ LABEL org.opencontainers.image.title="xberg-serve-ocrlight" \
 
 WORKDIR /app
 
-# tesseract-ocr-<lang> packages carry the .traineddata; the base tesseract-ocr
-# package carries none. libtesseract5/libleptonica pulled in transitively as
-# runtime deps of tesseract-ocr. libheif1 is the HEIC/AVIF runtime lib.
+# xberg links libtesseract5/libleptonica6 directly (confirmed by the ldd
+# guard-rail above) -- it never calls the `tesseract` CLI. Installing the
+# `tesseract-ocr` package instead of just its library would drag in, for
+# nothing: ~15 unused CLI/training binaries plus a whole font-rendering and
+# HTTP stack it pulls as Depends (libcairo2, libfontconfig1, libglib2.0,
+# libharfbuzz0b, libicu76, libpango*, libarchive13t64, and an embedded
+# libcurl4 -- a network client sitting in an image that should never egress).
+# Checked the real Debian trixie Packages index: libtesseract5's own Depends
+# is just libleptonica6 + libgomp1 + libc/libgcc/libstdc++, and
+# tesseract-ocr-<lang> only *Recommends* tesseract-ocr (no hard Depends),
+# so --no-install-recommends already lets us skip it.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         tini \
-        tesseract-ocr \
+        libtesseract5 \
+        libleptonica6 \
         tesseract-ocr-fra \
         tesseract-ocr-eng \
         tesseract-ocr-osd \
         libheif1; \
-    rm -rf /var/lib/apt/lists/*; \
+    rm -rf /var/lib/apt/lists/* /etc/apt/sources.list /etc/apt/sources.list.d/*; \
     groupadd --system --gid 10001 xberg; \
     useradd --system --uid 10001 --gid xberg --no-create-home --shell /usr/sbin/nologin xberg
 

@@ -4,10 +4,10 @@ Custom Docker images for [xberg](https://github.com/xberg-io/xberg) 1.1.1
 (MIT), packaged as a REST document-extraction service, published by CI to
 `ghcr.io/runyournode/xberg-serve`.
 
-| Profile | File | OCR | ML/ONNX/GPU | HEIC | Use case |
-|---|---|---|---|---|---|
-| `ultralight` | `docker/build/1.1.1/Dockerfile.ultralight` | no | no | yes | default — text-layer documents, HEIC images |
-| `ocrlight` | `docker/build/1.1.1/Dockerfile.ocrlight` | Tesseract (dynamic) | no | yes | scanned documents, HEIC images |
+| Profile | File | OCR | ML/ONNX/GPU | HEIC | Runtime base | Use case |
+|---|---|---|---|---|---|---|
+| `ultralight` | `docker/build/1.1.1/Dockerfile.ultralight` | no | no | yes | distroless (no shell, no package manager) | default — text-layer documents, HEIC images |
+| `ocrlight` | `docker/build/1.1.1/Dockerfile.ocrlight` | Tesseract (dynamic) | no | yes | `debian:trixie-slim` | scanned documents, HEIC images |
 
 Both run on CPU, with no download at runtime: everything needed (the `xberg`
 binary, Tesseract language packs for `ocrlight`) is baked into the image
@@ -28,7 +28,15 @@ exactly what gets compiled, instead of cloning the whole monorepo.
   formats/PDF/email/HTML/XML/archives/sqlite/mdx/svg/wordperfect, language
   detection, chunking) + axum server + HEIC/AVIF. HEIC adds no deep
   learning at all: `libheif` is a codec (like libjpeg), packaged in Debian
-  trixie (`libheif-dev`/`libheif1`), no source compile needed.
+  trixie (`libheif-dev`/`libheif1`), no source compile needed. Its runtime
+  stage is [distroless](https://github.com/GoogleContainerTools/distroless)
+  (`gcr.io/distroless/cc-debian13:nonroot`, same Debian release as the
+  builder so no glibc mismatch): no shell, no `apt`, no CLI binaries beyond
+  `xberg` itself and a statically-linked `tini`. Everything the runtime
+  needs (`libheif` + its dlopen'd codec plugin, since `libheif` loads those
+  at runtime rather than linking them) is extracted from the builder stage
+  by path and `COPY`'d in — there's no shell in the final stage to install
+  anything itself.
 - **`ocrlight`**: `--features "api,pdf-ocr,xberg/tesseract-dynamic,heic"` →
   ultralight + Tesseract dynamically linked against the system's
   `libtesseract`/`libleptonica`, instead of compiling those from vendored
@@ -104,17 +112,41 @@ standard Docker export/import.
 
 ## Hardening
 
-Containers run `read_only`, `cap_drop: ALL`, `no-new-privileges`, a fixed
-non-root UID 10001 (not a dynamic `useradd -r`: needed so the
-`docker/mount_runtime/` bind-mount can be chowned reproducibly), `/tmp` on a
-sized tmpfs (2 GB for ocrlight, which rasterizes pages). Proxies are cleared
-and `NO_PROXY=*`: an accidental outbound call should fail immediately. The
-port is published on `127.0.0.1` only. CPU/memory limits live in `.env` —
-keep `XBERG_MAX_CONCURRENT` <= the number of CPUs allocated.
+Both images: `read_only`, `cap_drop: ALL`, `no-new-privileges`, `/tmp` on a
+sized tmpfs (2 GB for ocrlight, which rasterizes pages), proxies cleared
+with `NO_PROXY=*` so an accidental outbound call fails immediately instead
+of hanging, port published on `127.0.0.1` only. CPU/memory limits live in
+`.env` — keep `XBERG_MAX_CONCURRENT` <= the number of CPUs allocated.
+
+Beyond that, the two profiles harden differently because their runtime
+bases differ:
+
+- **`ultralight`** is distroless: no shell, no package manager, no apt
+  sources to begin with, no CLI binaries beyond `xberg` and a static
+  `tini`. Runs as the distroless base's own fixed non-root user, uid/gid
+  **65532** (not a `useradd`d one — there's no shell to run `useradd` in).
+  Chown the bind-mount before first run:
+  `chown -R 65532:65532 docker/mount_runtime/cache_ultralight`.
+- **`ocrlight`** stays Debian-based (`debian:trixie-slim`) since Tesseract/
+  Leptonica's own dependency chain and the `libheif` plugin `dlopen()`
+  gotcha (see above) make a from-scratch distroless conversion riskier to
+  get right without a local test loop — deferred, not ruled out. It still
+  installs `libtesseract5`/`libleptonica6` directly instead of the full
+  `tesseract-ocr` CLI package: `xberg` links the library, never shells out
+  to the `tesseract` binary, so the CLI package would only add ~15 unused
+  binaries and an unrelated dependency tail (cairo/pango/fontconfig/ICU,
+  and an embedded **libcurl** — a network client with no business being in
+  a no-egress image). `/etc/apt/sources.list*` is cleared after install, so
+  even if `apt`/`dpkg` themselves are still present, there's nothing
+  configured left to fetch from. Runs as a fixed non-root UID **10001**
+  (`useradd --system`, not a dynamic one, so the bind-mount stays
+  chownable): `chown -R 10001:10001 docker/mount_runtime/cache_ocrlight`.
 
 ## To verify once built
 
-Three things not confirmed without actually running the binary:
+Things not confirmed without actually running the binary — this repo has
+no local Docker build loop, so the first real CI build/run is the actual
+test:
 
 1. **`xberg serve` flags.** `docker run --rm xberg-serve:ultralight serve
    --help`. `--host`/`--port` are assumed; adjust `CMD` and `command:` if
@@ -127,6 +159,15 @@ Three things not confirmed without actually running the binary:
    build already fails on its own if a `.traineddata` file or a library is
    missing (see the guard `RUN` steps in the Dockerfile), but it's worth
    checking `TESSDATA_PREFIX` in practice against a real scanned document.
+4. **`ultralight`'s distroless conversion.** The riskiest untested part of
+   this repo right now: `docker run --rm xberg-serve:ultralight serve
+   --help` needs to actually start (confirms the copied `.so` closure and
+   `tini` resolve correctly with no shell to fall back on for debugging),
+   and a real HEIC file needs to decode successfully (confirms the
+   manually-copied `libheif` codec plugin — `dlopen()`'d, not linked, so
+   invisible to `ldd` — actually landed and loads). If either fails, the
+   fix is almost certainly in the `assemble`/lib-collection stage of
+   `Dockerfile.ultralight`, not in the application itself.
 
 ## markgate integration
 
