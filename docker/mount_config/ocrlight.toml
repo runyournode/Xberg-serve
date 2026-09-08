@@ -1,0 +1,8 @@
+disable_ocr = false
+max_concurrent_extractions = 8
+
+# This part is ignore when running in container (set in compose.yaml / deploy/ressources/limits/cpus)
+#[concurrency]
+#max_threads = 8
+
+

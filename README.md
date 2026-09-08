@@ -10,7 +10,7 @@ Custom Docker images for [xberg](https://github.com/xberg-io/xberg) 1.1.1
 | `ocrlight` | `docker/build/1.1.1/Dockerfile.ocrlight` | Tesseract (dynamic) | no | yes | `debian:trixie-slim` | scanned documents, HEIC images |
 
 Both run on CPU, with no download at runtime: everything needed (the `xberg`
-binary, Tesseract language packs for `ocrlight`) is baked into the image
+binary, Tesseract language packs for `ocrlight` (fra+eng)) is baked into the image
 layer during `docker build`, on the CI runner that has internet access — not
 on the target machine.
 
@@ -62,11 +62,12 @@ use, which breaks air-gapped.
 ```
 docker/
   compose.yaml                    # both services, ghcr.io images
+  healthcheck.rs                  # dependency-free /health prober, compiled into both images
   build/<version>/                # one folder per upstream xberg release
     Dockerfile.ultralight
     Dockerfile.ocrlight
-  mount_config/                   # reserved (xberg has no config file today,
-                                   # ready if that changes)
+  mount_config/                   # ultralight.toml, ocrlight.toml -- each mounted
+                                   # read-only at /config/config.toml (serve --config)
   mount_runtime/
     cache_ultralight/             # bind-mount -> XBERG_CACHE_DIR
     cache_ocrlight/
@@ -107,8 +108,7 @@ two Dockerfiles, and updating `VERSIONS`.
 ## Running it
 
 ```bash
-cp .env.example .env
-docker compose -f docker/compose.yaml --env-file .env up -d
+docker compose -f docker/compose.yaml up -d
 ```
 
 `ultralight` on `127.0.0.1:8083`, `ocrlight` on `127.0.0.1:8084`. If the
@@ -122,8 +122,12 @@ standard Docker export/import.
 Both images: `read_only`, `cap_drop: ALL`, `no-new-privileges`, `/tmp` on a
 sized tmpfs (2 GB for ocrlight, which rasterizes pages), proxies cleared
 with `NO_PROXY=*` so an accidental outbound call fails immediately instead
-of hanging, port published on `127.0.0.1` only. CPU/memory limits live in
-`.env` — keep `XBERG_MAX_CONCURRENT` <= the number of CPUs allocated.
+of hanging, port published on `127.0.0.1` only (`ocrlight`; `ultralight`
+publishes on all interfaces — see `docker/compose.yaml`). Memory limits are
+literal per-service values in `docker/compose.yaml`'s
+`deploy.resources.limits`; CPU/concurrency is governed instead by
+`[concurrency].max_threads`, set explicitly per profile in
+`docker/mount_config/<profile>.toml`.
 
 Beyond that, the two profiles harden differently because their runtime
 bases differ:
@@ -164,8 +168,16 @@ rather than guessing and waiting on a CI round-trip.
 Confirmed locally already:
 
 - **`xberg serve` flags**: `--host`/`-H`, `--port`/`-p`, `--log-level`,
-  `--config` — `docker run --rm xberg-serve:ultralight serve --help`. The
-  Dockerfiles'/compose's assumed `--host`/`--port` are correct as-is.
+  `--config` — `docker run --rm xberg-serve:ultralight serve --help`.
+- **`--config` cannot carry `[server]`.** Tried mounting a `config.toml`
+  with both `[server]` and `[concurrency]` (the "nested format" the docs
+  describe) and running `serve --config` against it: fails outright —
+  `serve` also loads the same file as xberg's *extraction* config, which
+  `deny_unknown_fields`-rejects the top-level `server` key it doesn't
+  recognize. `mount_config/<profile>.toml` therefore holds `[concurrency]`
+  only; host/port stay `serve` CLI flags and CORS/upload limits stay env
+  vars (`XBERG_MAX_REQUEST_BODY_BYTES`/`XBERG_MAX_MULTIPART_FIELD_BYTES` in
+  `docker/compose.yaml`).
 - **`ultralight`'s distroless conversion actually starts**: `serve --help`
   and `--version` both run cleanly with no shared-library errors — the
   copied `.so` closure and static `tini` resolve correctly.
@@ -173,12 +185,22 @@ Confirmed locally already:
   doctor` reports `tesseract 5.5.0; tessdata for ... language(s) at
   /usr/share/tesseract-ocr/5/tessdata` — the dynamic-linking build and the
   language packs both resolve as intended.
+- **`xberg-healthcheck` against a real running server.** Built `ultralight`
+  locally, ran it with the real `mount_config/ultralight.toml` +
+  `serve --host --port --config` command from `compose.yaml`: `docker
+  inspect --format='{{.State.Health.Status}}'` reports `healthy`, `docker
+  exec ... /usr/local/bin/xberg-healthcheck` exits `0`, and `curl
+  /health` from the host returns `200` with the real JSON payload
+  (`{"status":"healthy",...}`). `ldd` on the compiled binary shows only
+  `libc`/`libgcc_s`/the loader — nothing the distroless base doesn't
+  already ship.
 
 Still open:
 
-1. **The real health endpoint.** `scripts/smoke.sh` reads `/openapi.json`.
-   The current `healthcheck` uses `xberg --version` in the meantime —
-   swap it for the real endpoint once known.
+1. **`xberg-healthcheck` reporting unhealthy.** Confirmed it reports
+   `healthy` against a live server (above); haven't yet confirmed it flips
+   to `unhealthy` if `xberg serve` dies inside the container while `tini`
+   stays up.
 2. **A real end-to-end extraction call** (`POST /extract` via `serve`,
    rather than the CLI's `extract`/`doctor`) against both profiles, ideally
    with `tests/corpus/` populated so `scripts/smoke.sh` has something to

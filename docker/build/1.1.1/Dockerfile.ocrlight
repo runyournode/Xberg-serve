@@ -47,9 +47,17 @@ RUN cargo install xberg-cli \
       --root /out \
  && strip /out/bin/xberg
 
+# HEALTHCHECK probe: same purpose-built, dependency-free binary as
+# `ultralight` (kept identical across profiles rather than reaching for
+# curl here, even though this Debian base has apt/shell available) -- see
+# docker/healthcheck.rs.
+COPY docker/healthcheck.rs /build/healthcheck.rs
+RUN rustc -O --edition 2021 -o /out/bin/xberg-healthcheck /build/healthcheck.rs \
+ && strip /out/bin/xberg-healthcheck
+
 # Expect to see libtesseract, libleptonica and libheif here, nothing else
 # unusual -- same guard-rail role as in ultralight.
-RUN ldd /out/bin/xberg | tee /out/ldd.txt && cat /out/ldd.txt
+RUN ldd /out/bin/xberg /out/bin/xberg-healthcheck | tee /out/ldd.txt && cat /out/ldd.txt
 
 FROM ${RUNTIME_IMAGE} AS runtime
 ARG XBERG_VERSION=1.1.1
@@ -97,8 +105,9 @@ RUN set -eux; \
         test -s "/usr/share/tesseract-ocr/5/tessdata/${lang}.traineddata"; \
     done
 
-COPY --from=builder /out/bin/xberg /usr/local/bin/xberg
-COPY --from=builder /out/ldd.txt   /usr/local/share/xberg/ldd.txt
+COPY --from=builder /out/bin/xberg             /usr/local/bin/xberg
+COPY --from=builder /out/bin/xberg-healthcheck /usr/local/bin/xberg-healthcheck
+COPY --from=builder /out/ldd.txt               /usr/local/share/xberg/ldd.txt
 
 ENV XBERG_CACHE_DIR=/app/.xberg \
     RUST_LOG=info \
@@ -106,13 +115,15 @@ ENV XBERG_CACHE_DIR=/app/.xberg \
 RUN install -d -o 10001 -g 10001 /app/.xberg
 
 # Fail the build rather than ship an image whose dynamic deps are unsatisfied.
-RUN ldd /usr/local/bin/xberg | grep -q 'not found' && exit 1 || true
+RUN ldd /usr/local/bin/xberg /usr/local/bin/xberg-healthcheck | grep -q 'not found' && exit 1 || true
 
 USER 10001:10001
 EXPOSE 8000
 
+# Queries the running server's own GET /health endpoint -- see
+# docker/healthcheck.rs for why this isn't a plain `curl`.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/xberg", "--version"]
+    CMD ["/usr/local/bin/xberg-healthcheck"]
 
 ENTRYPOINT ["/usr/bin/tini", "--", "xberg"]
 CMD ["serve", "--host", "0.0.0.0", "--port", "8000"]

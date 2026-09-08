@@ -1,7 +1,13 @@
 # xberg-serve -- two profiles built by .github/workflows/docker-publish.yaml
 # and published to ghcr.io/runyournode/xberg-serve.
 #
-#   docker compose -f docker/compose.yaml --env-file .env up -d
+#   docker compose -f docker/compose.yaml up -d
+#
+# No .env file: nothing here is a secret, so every tunable value is a
+# literal below. Only the thread-pool cap ([concurrency].max_threads) lives
+# in the matching mount_config/<profile>.toml -- host/port stay `serve` CLI
+# flags and CORS/upload limits stay env vars (see that file's comment for
+# why [server] can't go in config.toml too).
 #
 # Air-gap: both images are self-contained once built (no runtime downloads --
 # see docker/build/<version>/Dockerfile.* for what each profile bakes in).
@@ -10,87 +16,100 @@
 
 services:
   xberg-ultralight:
-    image: ghcr.io/runyournode/xberg-serve:${XBERG_TAG:-main}-ultralight
+    image: ghcr.io/runyournode/xberg-serve:main-ultralight
     container_name: xberg-ultralight
-    restart: unless-stopped
-    command:
-      - serve
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
+    ports:
+      - "8083:8000"
     environment:
-      RUST_LOG: ${XBERG_LOG:-info}
-      XBERG_MAX_CONCURRENT_EXTRACTIONS: ${XBERG_MAX_CONCURRENT:-2}
-      # Air-gap hygiene: nothing in this profile should ever egress. Empty
-      # proxies make an accidental outbound call fail fast and loudly instead
-      # of hanging.
+      # xberg conf that cannot be defined in config.toml or in serve arg
+      RUST_LOG: info
+      # HTTP request global concurrency,
+      XBERG_MAX_CONCURRENT_REQUESTS: 16  # default: 2 x CPUs, clamped to [4, 32]
+      # Max size (default: 104857600 = 100 MB)
+      XBERG_MAX_REQUEST_BODY_BYTES: 204857600
+      XBERG_MAX_MULTIPART_FIELD_BYTES: 204857600
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       NO_PROXY: "*"
-    ports:
-      - "127.0.0.1:${XBERG_PORT:-8083}:8000"
-    # ultralight's runtime image is distroless (no shell/useradd), so its
-    # fixed non-root user is the distroless base's own uid/gid 65532, not
-    # the 10001 used by ocrlight. Before first run:
-    #   chown -R 65532:65532 docker/mount_runtime/cache_ultralight
+    command:
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--config"
+      - "/config/config.toml"
     volumes:
-      - ./mount_runtime/cache_ultralight:/app/.xberg:Z
-    read_only: true
+      - ./mount_config/ultralight.toml:/config/config.toml:ro
     tmpfs:
-      - /tmp:size=512m,mode=1777
+      - /tmp:size=1g,mode=1777
+    # Security
+    read_only: true
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+     # Limit cpu+ram here
     deploy:
       resources:
         limits:
-          cpus: "${XBERG_CPUS:-2}"
-          memory: ${XBERG_MEM:-1g}
+          cpus: 8
+          memory: 2g
+
     healthcheck:
-      # Adjust once verified against `xberg serve --help` / the OpenAPI doc.
-      test: ["CMD", "/usr/local/bin/xberg", "--version"]
+      test: ["CMD", "/usr/local/bin/xberg-healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
+
+
   xberg-ocrlight:
-    image: ghcr.io/runyournode/xberg-serve:${XBERG_TAG:-main}-ocrlight
+    image: ghcr.io/runyournode/xberg-serve:main-ocrlight
     container_name: xberg-ocrlight
-    restart: unless-stopped
-    command:
-      - serve
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
+    ports:
+      - "8083:8000"
     environment:
-      RUST_LOG: ${XBERG_LOG:-info}
-      XBERG_MAX_CONCURRENT_EXTRACTIONS: ${XBERG_MAX_CONCURRENT:-2}
+      # xberg conf that cannot be defined in config.toml or in serve arg
+      RUST_LOG: info
+      # HTTP request global concurrency,
+      XBERG_MAX_CONCURRENT_REQUESTS: 16  # default: 2 x CPUs, clamped to [4, 32]
+      # Max size (default: 104857600 = 100 MB)
+      XBERG_MAX_REQUEST_BODY_BYTES: 204857600
+      XBERG_MAX_MULTIPART_FIELD_BYTES: 204857600
       HTTP_PROXY: ""
       HTTPS_PROXY: ""
       NO_PROXY: "*"
-    ports:
-      - "127.0.0.1:${XBERG_OCR_PORT:-8084}:8000"
+    command:
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--config"
+      - "/config/config.toml"
     volumes:
-      - ./mount_runtime/cache_ocrlight:/app/.xberg:Z
-    read_only: true
-    tmpfs:
-      # OCR renders pages to bitmaps; give it real scratch space.
+      - ./mount_config/ocrlight.toml:/config/config.toml:ro
+    tmpfs:  # ocr would rasterize, give some space
       - /tmp:size=2g,mode=1777
+    # Security
+    read_only: true
+    restart: unless-stopped
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # Limit cpu+ram here
     deploy:
       resources:
         limits:
-          cpus: "${XBERG_OCR_CPUS:-4}"
-          memory: ${XBERG_OCR_MEM:-3g}
+          cpus: 8
+          memory: 3g
+
     healthcheck:
-      test: ["CMD", "/usr/local/bin/xberg", "--version"]
+      test: [ "CMD", "/usr/local/bin/xberg-healthcheck" ]
       interval: 30s
       timeout: 5s
       retries: 3

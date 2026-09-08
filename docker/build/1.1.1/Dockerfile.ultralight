@@ -35,10 +35,20 @@ RUN cargo install xberg-cli \
       --root /out \
  && strip /out/bin/xberg
 
+# HEALTHCHECK probe: distroless has no shell/curl to exec instead, so this
+# purpose-built, dependency-free (std-only) binary makes the actual
+# GET /health request against the running server. Shared with `ocrlight` --
+# see docker/healthcheck.rs.
+COPY docker/healthcheck.rs /build/healthcheck.rs
+RUN rustc -O --edition 2021 -o /out/bin/xberg-healthcheck /build/healthcheck.rs \
+ && strip /out/bin/xberg-healthcheck
+
 # Record what actually got linked. This is the guard rail: if OCR, ORT or a
 # codec feature sneaks back in, extra shared objects show up here and the
-# build breaks loudly instead of silently shipping a fatter image.
-RUN ldd /out/bin/xberg | tee /out/ldd.txt
+# build breaks loudly instead of silently shipping a fatter image. Also
+# covers xberg-healthcheck, even though a std-only binary should need
+# nothing beyond what distroless cc-debian13 already ships.
+RUN ldd /out/bin/xberg /out/bin/xberg-healthcheck | tee /out/ldd.txt
 
 # Collect the runtime .so closure for the distroless final stage below (no
 # apt/shell there to install anything). Skip libs guaranteed present in
@@ -53,7 +63,7 @@ RUN ldd /out/bin/xberg | tee /out/ldd.txt
 # looks up via DT_NEEDED.
 RUN set -eux; \
     mkdir -p /out/lib; \
-    ldd /out/bin/xberg | awk '{print $3}' | grep '^/' | sort -u \
+    ldd /out/bin/xberg /out/bin/xberg-healthcheck | awk '{print $3}' | grep '^/' | sort -u \
       | grep -Ev '/(libc|libm|libpthread|libdl|librt|libgcc_s|libstdc\+\+|ld-linux-x86-64)\.so' \
       | while read -r so; do \
           real_dir="$(readlink -f "$(dirname "$so")")"; \
@@ -96,10 +106,11 @@ LABEL org.opencontainers.image.title="xberg-serve-ultralight" \
 
 WORKDIR /app
 
-COPY --from=builder /out/bin/xberg /usr/local/bin/xberg
-COPY --from=builder /out/ldd.txt   /usr/local/share/xberg/ldd.txt
-COPY --from=builder /out/lib/      /
-COPY --from=assemble /tini         /tini
+COPY --from=builder /out/bin/xberg             /usr/local/bin/xberg
+COPY --from=builder /out/bin/xberg-healthcheck /usr/local/bin/xberg-healthcheck
+COPY --from=builder /out/ldd.txt               /usr/local/share/xberg/ldd.txt
+COPY --from=builder /out/lib/                  /
+COPY --from=assemble /tini                     /tini
 COPY --from=assemble --chown=65532:65532 /assemble/app/.xberg /app/.xberg
 
 ENV XBERG_CACHE_DIR=/app/.xberg \
@@ -110,8 +121,10 @@ ENV XBERG_CACHE_DIR=/app/.xberg \
 USER 65532:65532
 EXPOSE 8000
 
+# Queries the running server's own GET /health endpoint -- see
+# docker/healthcheck.rs for why this isn't a plain `curl`.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/xberg", "--version"]
+    CMD ["/usr/local/bin/xberg-healthcheck"]
 
 # Verify the exact flag names once against the built image:
 #   docker run --rm xberg-serve:ultralight serve --help
